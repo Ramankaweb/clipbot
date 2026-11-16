@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: clipbot
+    runtime: docker
+    plan: starter            # 24/7 ke liye paid plan (free plan 15 min baad sleep ho jata hai)
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:                    # settings (API keys, links) restart ke baad bhi bachi rahengi
+      name: clipbot-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: ADMIN_PASSWORD  # web panel + Telegram /start ke liye password
+        sync: false
+      - key: TELEGRAM_TOKEN  # optional: baad me panel se bhi daal sakte ho
+        sync: false
+      - key: GROQ_API_KEY    # optional: baad me panel se bhi daal sakte ho
+        sync: false
