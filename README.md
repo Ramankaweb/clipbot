@@ -9,7 +9,7 @@ Live link do → bot stream record karta rehta hai (rolling buffer) → trigger 
 | **Audio keyword** | Har ~15 sec ka audio Groq Whisper se transcribe; "kill", "paani", "headshot" etc. aaye to auto clip |
 | **Manual** | Telegram `/clip title` ya web panel ka "Clip now" button |
 
-Subscriber-only chat ON ho to bhi chat *padhi* ja sakti hai (pytchat bina login ke padhta hai). Sirf subscribers likh sakte hain, jo ek natural filter ban jata hai. Panel me "sirf mod/owner/member" ka option bhi hai. Members-only *stream* me chat bina login ke nahi dikhti.
+Subscriber-only chat ON ho to bhi chat *padhi* ja sakti hai (bot apna chat reader use karta hai, login nahi chahiye). Sirf subscribers likh sakte hain, jo ek natural filter ban jata hai. Panel me "sirf mod/owner/member" ka option bhi hai. Members-only *stream* me chat bina login ke nahi dikhti.
 
 ## Deploy (Render)
 1. Ye folder GitHub repo me push karo.
@@ -24,6 +24,18 @@ Subscriber-only chat ON ho to bhi chat *padhi* ja sakti hai (pytchat bina login 
 - `/health` endpoint Render health check ke liye hai.
 - **Starter plan (~$7/mo) lo.** Free plan 15 min inactivity par sleep hota hai aur disk bhi nahi milti, to bot 24/7 nahi chal sakta. Free par bhi chalana ho to UptimeRobot se `/health` har 5 min ping karwao, par wo reliable nahi hai.
 - Restart/redeploy ke baad active links apne aap resume hote hain (disk par save hote hain).
+
+## Telegram na chale to
+1. Web panel Dashboard ke **Telegram** card me status dekho (connected / token galat / conflict).
+2. Bot ko `/start <ADMIN_PASSWORD>` bhejo (sirf Start button dabana kaafi nahi, password dena hoga).
+3. "Conflict" dikhe to isi token par koi aur bot (purana t1 bot, Termux, doosra Render instance) chal raha hai, use band karo ya @BotFather se naya token lo.
+
+## Extra features
+- `/menu` – buttons (Status, Clip now, Stop all, Audio on/off, Ping)
+- **Vertical reel output** – Settings > Output format: `vertical_blur` (blur background) ya `vertical_crop`, 1080x1920
+- **Post-roll** – trigger ke baad 0-30 sec ka action bhi clip me
+- **Offline stream ka intezaar** – channel `/live` link do, live aate hi bot khud shuru (Settings > retry)
+- **Allowed users** – sirf chune hue YouTube naam clip command de sakein
 
 ## Telegram commands
 - Link bhejo ya `/watch <link>` – watch shuru

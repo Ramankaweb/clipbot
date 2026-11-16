@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -87,6 +88,10 @@ DEFAULTS = {
     "audio_language": "",
     "keywords": "kill, kills, paani, pani, headshot, clutch, पानी, किल",
     "max_streams": 2,
+    "output_mode": "original",   # original | vertical_blur | vertical_crop
+    "post_roll_seconds": 0,
+    "retry_forever": False,
+    "chat_allowed_users": "",
     "keepalive": True,
     "cookies": "",
     "ytdlp_extra_args": "",
@@ -272,8 +277,10 @@ class Watcher:
         self.last_clip = 0
         self.clips = 0
         self.err = ""
+        self.waiting_notified = False
         self.video_id = yt_id(link)
         self.chat_state = "-"
+        self.chat_err = ""
         self.clip_lock = threading.Lock()
 
     # ---- lifecycle
@@ -319,21 +326,32 @@ class Watcher:
 
     def resolve(self):
         h = int(S.get("max_height"))
-        cmd = ["yt-dlp", "-g", "--no-warnings", "--no-playlist",
-               "-f", f"best[height<={h}]/best"]
+        base = ["yt-dlp", "-g", "--no-warnings", "--no-playlist",
+                "-f", f"best[height<={h}]/best"]
+        if shutil.which("node"):
+            base += ["--js-runtimes", "node"]
         cf = cookies_file()
         if cf:
-            cmd += ["--cookies", cf]
-        cmd += shlex.split(S.get("ytdlp_extra_args") or "")
-        cmd += ["--", self.link]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
+            base += ["--cookies", cf]
+        base += shlex.split(S.get("ytdlp_extra_args") or "")
+        # default client first, then HLS-friendly fallbacks (live streams)
+        attempts = [[],
+                    ["--extractor-args", "youtube:player_client=web_safari"],
+                    ["--extractor-args", "youtube:player_client=tv"]]
+        last = "yt-dlp fail"
+        for extra in attempts:
+            if self.stop_ev.is_set():
+                break
+            r = subprocess.run(base + extra + ["--", self.link],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                urls = [u for u in r.stdout.split() if u.startswith("http")]
+                if urls:
+                    return urls[:2]
             lines = [l for l in r.stderr.strip().splitlines() if l.strip()]
-            raise RuntimeError(scrub(lines[-1] if lines else "yt-dlp fail"))
-        urls = [u for u in r.stdout.split() if u.startswith("http")]
-        if not urls:
-            raise RuntimeError("stream URL nahi mila")
-        return urls[:2]
+            if lines:
+                last = scrub(lines[-1])
+        raise RuntimeError(last)
 
     def record_loop(self):
         fails = 0
@@ -357,6 +375,7 @@ class Watcher:
                     self.proc = subprocess.Popen(cmd, stderr=lf, stdout=subprocess.DEVNULL)
                     self.state = "recording"
                     self.err = ""
+                    self.waiting_notified = False
                     self.logm("recording shuru")
                     while self.proc.poll() is None and not self.stop_ev.is_set():
                         time.sleep(1)
@@ -372,11 +391,15 @@ class Watcher:
                     warned = True
                     notify("⚠️ YouTube ne bot-check manga. Admin panel > Settings me "
                            "YouTube cookies (cookies.txt) daalo.")
-            if fails >= 6:
+            if fails >= 6 and S.get("retry_forever"):
+                if not self.waiting_notified:
+                    self.waiting_notified = True
+                    notify(f"⏳ Stream abhi offline: {self.link}\nLive aate hi apne aap shuru ho jayega.")
+            elif fails >= 6:
                 self.finish("Stream khatam ya access nahi ho raha: " + (self.err or "?"))
                 return
             self.state = "retrying"
-            self.stop_ev.wait(min(5 * 2 ** fails, 60))
+            self.stop_ev.wait(min(5 * 2 ** min(fails, 6), 60))
 
     # ---- triggers
     def auto_clip(self, seconds, title, reason, extra=""):
@@ -390,6 +413,10 @@ class Watcher:
 
     def make_clip(self, seconds, title, reason, extra=""):
         seconds = max(5, min(int(seconds), 120))
+        post = max(0, min(int(S.get("post_roll_seconds") or 0), 30))
+        if post:  # kill ke baad ka action bhi clip me aaye
+            self.stop_ev.wait(post)
+            seconds += post
         with self.clip_lock:
             segs = self.segments()
             if len(segs) < 2:
@@ -410,6 +437,20 @@ class Watcher:
                     good_ = run_ff(["-f", "concat", "-safe", "0", "-i", lst,
                                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
                                     "-c:a", "aac", "-movflags", "+faststart", out])
+                mode = S.get("output_mode")
+                if good_ and mode in ("vertical_blur", "vertical_crop"):
+                    vf = ("split=2[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+                          "crop=1080:1920,boxblur=25:5[bg];[b]scale=1080:-2[fg];"
+                          "[bg][fg]overlay=(W-w)/2:(H-h)/2") if mode == "vertical_blur" \
+                        else "scale=-2:1920,crop=1080:1920"
+                    vout = base + "_v.mp4"
+                    if run_ff(["-i", out, "-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
+                               "-crf", "24", "-c:a", "aac", "-b:a", "128k",
+                               "-movflags", "+faststart", vout], timeout=240) and os.path.exists(vout):
+                        os.remove(out)
+                        out = vout
+                    else:
+                        self.logm("vertical convert fail, original bhej raha hoon")
                 if not good_ or not os.path.exists(out):
                     msg = "ffmpeg clip nahi bana paaya"
                 elif os.path.getsize(out) > 49 * 1024 * 1024:
@@ -423,7 +464,7 @@ class Watcher:
             except Exception as e:
                 msg = scrub(e)
             finally:
-                for p in (lst, out):  # always delete
+                for p in (lst, base + ".mp4", base + "_v.mp4"):  # always delete
                     try:
                         os.remove(p)
                     except OSError:
@@ -437,13 +478,91 @@ class Watcher:
                 notify(f"❌ Clip fail ({title}): {msg}")
             return ok, msg
 
-    # ---- chat trigger (no YouTube API)
+    # ---- chat trigger (own InnerTube reader, no YouTube API key, no pytchat)
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+    def chat_session(self):
+        s = requests.Session()
+        s.headers.update({"User-Agent": self.UA, "Accept-Language": "en-US,en;q=0.9"})
+        cf = cookies_file()
+        if cf:
+            try:
+                from http.cookiejar import MozillaCookieJar
+                jar = MozillaCookieJar(cf)
+                jar.load(ignore_discard=True, ignore_expires=True)
+                s.cookies.update(jar)
+            except Exception as e:
+                self.logm(f"cookies load (chat): {scrub(e)[:100]}")
+        return s
+
+    def chat_init(self, s):
+        r = s.get("https://www.youtube.com/live_chat",
+                  params={"is_popout": "1", "v": self.video_id}, timeout=30)
+        html = r.text
+        m = re.search(r'ytInitialData"?\]?\s*=\s*', html)
+        if not m:
+            raise RuntimeError("chat page parse nahi hua (cookies/consent/bot-check?)")
+        data, _ = json.JSONDecoder().raw_decode(html, m.end())
+        lcr = (data.get("contents") or {}).get("liveChatRenderer")
+        if not lcr:
+            raise RuntimeError("live chat nahi mili (chat off / stream live nahi / members-only)")
+        key = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
+        ver = re.search(r'"INNERTUBE_CONTEXT_CLIENT_VERSION":"([^"]+)"', html)
+        cont = None
+        try:  # prefer "Live chat" view over "Top chat" (top chat filters messages)
+            items = lcr["header"]["liveChatHeaderRenderer"]["viewSelector"][
+                "sortFilterSubMenuRenderer"]["subMenuItems"]
+            for it in items:
+                if "live" in (it.get("title") or "").lower():
+                    cont = it["continuation"]["reloadContinuationData"]["continuation"]
+        except (KeyError, TypeError):
+            pass
+        if not cont:
+            c0 = lcr["continuations"][0]
+            cont = next(iter(c0.values()))["continuation"]
+        return (key.group(1) if key else "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+                ver.group(1) if ver else "2.20241201.01.00", cont)
+
+    def chat_poll(self, s, key, ver, cont):
+        url = ("https://www.youtube.com/youtubei/v1/live_chat/get_live_chat"
+               f"?key={key}&prettyPrint=false")
+        ctx = {"client": {"clientName": "WEB", "clientVersion": ver, "hl": "en"}}
+        seen = deque(maxlen=500)
+        while not self.stop_ev.is_set():
+            r = s.post(url, json={"context": ctx, "continuation": cont}, timeout=30)
+            r.raise_for_status()
+            lc = (r.json().get("continuationContents") or {}).get("liveChatContinuation")
+            if not lc:
+                return  # chat ended
+            for a in lc.get("actions", []):
+                item = ((a.get("addChatItemAction") or {}).get("item") or {}).get(
+                    "liveChatTextMessageRenderer")
+                if not item or item.get("id") in seen:
+                    continue
+                seen.append(item.get("id"))
+                try:  # ignore backlog / old messages
+                    if int(item.get("timestampUsec", 0)) / 1e6 < time.time() - 45:
+                        continue
+                except ValueError:
+                    pass
+                try:
+                    self.on_chat_item(item)
+                except Exception as e:
+                    log.warning("chat parse: %s", e)
+            nxt, wait = None, 3.0
+            for c in lc.get("continuations", []):
+                for k in ("invalidationContinuationData", "timedContinuationData",
+                          "reloadContinuationData"):
+                    if k in c:
+                        nxt = c[k]["continuation"]
+                        wait = c[k].get("timeoutMs", 3000) / 1000
+            if not nxt:
+                return
+            cont = nxt
+            self.stop_ev.wait(max(1.5, min(wait, 8)))
+
     def chat_loop(self):
-        try:
-            import pytchat
-        except ImportError:
-            self.chat_state = "pytchat missing"
-            return
         while not self.stop_ev.is_set():
             if not S.get("chat_enabled") or "youtu" not in self.link:
                 self.chat_state = "off"
@@ -456,24 +575,27 @@ class Watcher:
                     self.stop_ev.wait(20)
                     continue
             try:
-                chat = pytchat.create(video_id=self.video_id, interruptable=False)
+                self.chat_state = "connecting"
+                s = self.chat_session()
+                key, ver, cont = self.chat_init(s)
                 self.chat_state = "reading"
-                while chat.is_alive() and not self.stop_ev.is_set():
-                    for c in chat.get().sync_items():
-                        try:
-                            self.on_chat(c)
-                        except Exception as e:
-                            log.warning("chat parse: %s", e)
-                    time.sleep(1)
+                self.logm("chat connected")
+                self.chat_err = ""
+                self.chat_poll(s, key, ver, cont)
                 self.chat_state = "reconnecting"
             except Exception as e:
                 self.chat_state = "error"
-                self.logm(f"chat error: {scrub(e)[:200]}")
-            self.stop_ev.wait(10)
+                msg = scrub(e)[:200]
+                if msg != self.chat_err:  # no log spam for a repeating error
+                    self.chat_err = msg
+                    self.logm(f"chat error: {msg}")
+            self.stop_ev.wait(20)
 
     def lookup_id(self):
         try:
             cmd = ["yt-dlp", "--print", "id", "--skip-download", "--no-playlist"]
+            if shutil.which("node"):
+                cmd += ["--js-runtimes", "node"]
             cf = cookies_file()
             if cf:
                 cmd += ["--cookies", cf]
@@ -483,23 +605,33 @@ class Watcher:
         except Exception:
             return None
 
-    def on_chat(self, c):
+    def on_chat_item(self, item):
+        text = "".join(r.get("text") or (r.get("emoji") or {}).get("emojiId", "")
+                       for r in (item.get("message") or {}).get("runs", []))
+        author = (item.get("authorName") or {}).get("simpleText", "?")
+        badges = " ".join(((b.get("liveChatAuthorBadgeRenderer") or {}).get("tooltip") or "")
+                          for b in item.get("authorBadges", [])).lower()
+        self.on_chat(text, author, badges)
+
+    def on_chat(self, text, author, badges=""):
         name = (S.get("bot_name") or "").strip()
         if not name:
             return
-        m = re.search(r"@?" + re.escape(name) + r"\s+clip\s*cut\b(.*)", c.message or "", re.I | re.S)
+        m = re.search(r"@?" + re.escape(name) + r"\s+clip\s*cut\b(.*)", text or "", re.I | re.S)
         if not m:
             return
+        allowed = [x.strip().lower() for x in (S.get("chat_allowed_users") or "").split(",") if x.strip()]
+        if allowed and author.lower() not in allowed:
+            return
         if S.get("chat_who") == "mods_members":
-            a = c.author
-            if not (a.isChatModerator or a.isChatOwner or a.isChatSponsor):
+            if not any(w in badges for w in ("moderator", "owner", "member")):
                 return
         rest = m.group(1).strip()
         p = re.search(r"\((.*?)\)", rest)
         title = (p.group(1) if p else rest).strip(" -:") or "Clip"
         title = title[:200]
-        self.logm(f"chat command from {c.author.name}: {title}")
-        self.auto_clip(int(S.get("clip_seconds")), title, "chat", f"by {c.author.name}")
+        self.logm(f"chat command from {author}: {title}")
+        self.auto_clip(int(S.get("clip_seconds")), title, "chat", f"by {author}")
 
     # ---- audio trigger (Groq Whisper)
     def audio_loop(self):
@@ -572,7 +704,6 @@ class Watcher:
 
 
 def shutil_rm(path):
-    import shutil
     shutil.rmtree(path, ignore_errors=True)
 
 
@@ -641,54 +772,62 @@ def clip_now(ident, title):
 # --------------------------------------------------------------------------
 # telegram bot (long polling) - private: only registered owners
 # --------------------------------------------------------------------------
+TG_STATE = {"ok": False, "me": "", "err": "Telegram token nahi daala", "last": 0}
+LAST_HINT = {}
+
 HELP = (
     "🎬 ClipBot commands\n"
     "• Live link seedha bhej do (ya /watch <link>)\n"
-    "• /stop [id|all] – stream band\n"
+    "• /menu – buttons wala control panel\n"
     "• /status – kya chal raha hai\n"
     "• /clip [title] – abhi ki last clip\n"
-    "• /set <key> <value> – bot_name, clip_seconds, cooldown_seconds, keywords, "
-    "audio_enabled, chat_enabled, chat_who\n"
+    "• /stop [id|all] – stream band\n"
     "• /audio on|off\n"
-    "API keys sirf web admin panel se badalte hain."
+    "• /ping – bot check\n"
+    "• /set <key> <value> – bot_name, clip_seconds, post_roll_seconds, cooldown_seconds, "
+    "keywords, audio_enabled, chat_enabled, chat_who, output_mode, retry_forever\n"
+    "API keys sirf web admin panel se badalti hain."
 )
 SET_KEYS = {"bot_name": str, "clip_seconds": int, "cooldown_seconds": int, "keywords": str,
-            "audio_enabled": bool, "chat_enabled": bool, "chat_who": str}
-RANGES = {"clip_seconds": (5, 60), "cooldown_seconds": (0, 600)}
+            "audio_enabled": bool, "chat_enabled": bool, "chat_who": str,
+            "post_roll_seconds": int, "output_mode": str, "retry_forever": bool}
+RANGES = {"clip_seconds": (5, 60), "cooldown_seconds": (0, 600), "post_roll_seconds": (0, 30)}
+CHOICES = {"chat_who": ("all", "mods_members"),
+           "output_mode": ("original", "vertical_blur", "vertical_crop")}
+COMMANDS = [("menu", "Buttons wala control panel"), ("status", "Chal rahe streams"),
+            ("clip", "Abhi ki clip banao"), ("stop", "Stream band karo"),
+            ("audio", "Audio trigger on/off"), ("ping", "Bot check"), ("help", "Madad")]
+MENU_KB = {"inline_keyboard": [
+    [{"text": "📊 Status", "callback_data": "status"},
+     {"text": "✂️ Clip now", "callback_data": "clip"}],
+    [{"text": "⏹ Stop all", "callback_data": "stop all"},
+     {"text": "🎧 Audio on/off", "callback_data": "audio toggle"}],
+    [{"text": "🏓 Ping", "callback_data": "ping"}]]}
 
 
 def to_bool(v):
     return v.strip().lower() in ("1", "on", "true", "yes", "haan")
 
 
-def handle(u):
-    m = u.get("message") or {}
-    text = (m.get("text") or "").strip()
-    chat = str((m.get("chat") or {}).get("id", ""))
-    if not text or not chat:
-        return
-    cmd, _, arg = text.partition(" ")
-    cmd, arg = cmd.split("@")[0].lower(), arg.strip()
-
-    if cmd == "/start" and chat not in owners():
-        if locked("tg" + chat):
-            return
-        if arg and check_pw(arg):
-            good("tg" + chat)
-            S.update(owner_chat_ids=owners() + [chat])
-            tg("deleteMessage", {"chat_id": chat, "message_id": m.get("message_id")})
-            say(chat, "✅ Registered. Ab ye bot sirf tumhara hai.\n\n" + HELP)
-        else:
-            bad("tg" + chat)
-        return
-    if chat not in owners():
-        return  # private: ignore everyone else silently
-
-    if cmd in ("/start", "/help"):
+def run_cmd(chat, cmd, arg, text=""):
+    if re.match(r"https?://", text or ""):
+        ok, msg = start_watch(text.split()[0])
+        say(chat, ("✅ " if ok else "⚠️ ") + msg)
+    elif cmd in ("/start", "/help"):
         say(chat, HELP)
-    elif cmd == "/watch" or re.match(r"https?://", text):
-        link = arg if cmd == "/watch" else text.split()[0]
-        say(chat, ("✅ " if (r := start_watch(link))[0] else "⚠️ ") + r[1])
+    elif cmd == "/menu":
+        tg("sendMessage", {"chat_id": chat, "text": "🎛 Control panel",
+                           "reply_markup": json.dumps(MENU_KB)})
+    elif cmd == "/ping":
+        say(chat, f"🏓 Bot zinda hai\nStreams: {len(WATCHERS)} • Audio: "
+                  f"{'ON' if S.get('audio_enabled') else 'OFF'} • Chat cmd: "
+                  f"{'ON' if S.get('chat_enabled') else 'OFF'}\n"
+                  f"Chat command: {S.get('bot_name')} clip cut (title)\n"
+                  f"Output: {S.get('output_mode')} • Clip: {S.get('clip_seconds')}s "
+                  f"+ {S.get('post_roll_seconds')}s baad")
+    elif cmd == "/watch":
+        ok, msg = start_watch(arg)
+        say(chat, ("✅ " if ok else "⚠️ ") + msg)
     elif cmd == "/stop":
         say(chat, f"⏹ {stop_watch(arg or None)} stream band")
     elif cmd == "/status":
@@ -704,8 +843,8 @@ def handle(u):
         ok, msg = clip_now(None, arg)
         say(chat, ("✂️ " if ok else "⚠️ ") + msg)
     elif cmd == "/audio":
-        S.update(audio_enabled=to_bool(arg))
-        say(chat, f"Audio trigger: {'ON' if S.get('audio_enabled') else 'OFF'}")
+        S.update(audio_enabled=(not S.get("audio_enabled")) if arg == "toggle" else to_bool(arg))
+        say(chat, f"🎧 Audio trigger: {'ON' if S.get('audio_enabled') else 'OFF'}")
     elif cmd == "/set":
         k, _, v = arg.partition(" ")
         if k not in SET_KEYS or not v.strip():
@@ -716,35 +855,98 @@ def handle(u):
             if k in RANGES:
                 lo, hi = RANGES[k]
                 val = max(lo, min(hi, val))
-            if k == "chat_who" and val not in ("all", "mods_members"):
-                raise ValueError("all ya mods_members")
+            if k in CHOICES and val not in CHOICES[k]:
+                raise ValueError("options: " + ", ".join(CHOICES[k]))
         except ValueError as e:
             say(chat, f"Galat value: {e}")
             return
         S.update(**{k: val})
         say(chat, f"✅ {k} = {val}")
     else:
-        say(chat, "Samjha nahi. /help dekho.")
+        say(chat, "Samjha nahi. /help ya /menu dekho.")
+
+
+def handle(u):
+    cb = u.get("callback_query")
+    if cb:  # inline button press
+        chat = str(((cb.get("message") or {}).get("chat") or {}).get("id", ""))
+        tg("answerCallbackQuery", {"callback_query_id": cb.get("id")})
+        if chat in owners():
+            cmd, _, arg = ("/" + (cb.get("data") or "")).partition(" ")
+            run_cmd(chat, cmd, arg.strip())
+        return
+    m = u.get("message") or {}
+    text = (m.get("text") or "").strip()
+    chat = str((m.get("chat") or {}).get("id", ""))
+    if not text or not chat:
+        return
+    cmd, _, arg = text.partition(" ")
+    cmd, arg = cmd.split("@")[0].lower(), arg.strip()
+
+    if chat not in owners():
+        if cmd == "/start" and arg:  # registration attempt
+            if locked("tg" + chat):
+                say(chat, "⏳ Bahut galat koshish. 5 min baad try karo.")
+            elif check_pw(arg):
+                good("tg" + chat)
+                S.update(owner_chat_ids=owners() + [chat])
+                tg("deleteMessage", {"chat_id": chat, "message_id": m.get("message_id")})
+                say(chat, "✅ Registered! Ab ye bot sirf tumhara hai.\n\n" + HELP)
+                tg("sendMessage", {"chat_id": chat, "text": "🎛 Control panel",
+                                   "reply_markup": json.dumps(MENU_KB)})
+            else:
+                bad("tg" + chat)
+                say(chat, "❌ Password galat. ADMIN_PASSWORD wahi hai jo web panel login ka hai.")
+        elif time.time() - LAST_HINT.get(chat, 0) > 30:  # don't spam strangers
+            LAST_HINT[chat] = time.time()
+            say(chat, "🔒 Ye private bot hai.\nOwner register karne ke liye bhejo:\n"
+                      "/start <ADMIN_PASSWORD>\n(wahi password jo web panel login ka hai)")
+        return
+
+    run_cmd(chat, cmd, arg, text)
 
 
 def tg_loop():
-    offset, last_tok = None, None
+    offset, last_tok, last_err = None, None, ""
     while True:
         tok = S.get("telegram_token")
         if not tok:
+            TG_STATE.update(ok=False, me="", err="Telegram token nahi daala (Settings me daalo)")
             time.sleep(5)
             continue
         try:
             if tok != last_tok:
+                me = requests.get(f"https://api.telegram.org/bot{tok}/getMe", timeout=20).json()
+                if not me.get("ok"):
+                    TG_STATE.update(ok=False, me="",
+                                    err="Token galat hai: " + str(me.get("description")))
+                    time.sleep(10)
+                    continue
+                TG_STATE.update(me=me["result"].get("username", ""))
                 requests.post(f"https://api.telegram.org/bot{tok}/deleteWebhook", timeout=20)
-                last_tok = tok
+                tg("setMyCommands", {"commands": json.dumps(
+                    [{"command": c, "description": d} for c, d in COMMANDS])})
+                last_tok, offset = tok, None
+                log.info("telegram connected: @%s", TG_STATE["me"])
             r = requests.get(f"https://api.telegram.org/bot{tok}/getUpdates",
-                             params={"timeout": 25, "offset": offset}, timeout=40)
+                             params={"timeout": 25, "offset": offset,
+                                     "allowed_updates": json.dumps(["message", "callback_query"])},
+                             timeout=40)
             j = r.json()
             if not j.get("ok"):
-                log.warning("getUpdates: %s", j.get("description"))
+                if j.get("error_code") == 409:
+                    err = ("Conflict: isi token par koi aur bot/server bhi chal raha hai "
+                           "(purana bot, Termux ya doosra Render instance). Use band karo.")
+                else:
+                    err = str(j.get("description"))
+                TG_STATE.update(ok=False, err=err)
+                if err != last_err:
+                    log.warning("telegram: %s", err)
+                    last_err = err
                 time.sleep(8)
                 continue
+            TG_STATE.update(ok=True, err="", last=time.time())
+            last_err = ""
             for u in j["result"]:
                 offset = u["update_id"] + 1
                 try:
@@ -752,6 +954,7 @@ def tg_loop():
                 except Exception:
                     log.exception("handle error")
         except Exception as e:
+            TG_STATE.update(ok=False, err="Network error: " + scrub(e)[:120])
             log.warning("telegram poll: %s", scrub(e))
             time.sleep(6)
 
@@ -811,10 +1014,13 @@ FIELDS = [
         ("cooldown_seconds", "Cooldown (sec)", "number", "Do auto clips ke beech minimum gap"),
         ("buffer_seconds", "Buffer (sec)", "number", "40-300, RAM/disk /tmp me"),
         ("max_height", "Max video height", "number", "480/720 - chhota = chhoti file"),
+        ("output_mode", "Output format", "select:original,vertical_blur,vertical_crop", "original = jaisa stream hai. vertical = 9:16 reel (1080x1920), thoda slow"),
+        ("post_roll_seconds", "Trigger ke baad ke extra sec", "number", "0-30. Kill ke baad ka action bhi clip me aayega"),
     ]),
     ("💬 Chat trigger", [
         ("chat_enabled", "Chat command ON", "bool", ""),
         ("chat_who", "Kaun command de sakta hai", "select:all,mods_members", "mods_members = sirf mod/owner/member"),
+        ("chat_allowed_users", "Sirf ye log command de sakte hain (optional)", "text", "YouTube names, comma separated. Khali = sab"),
     ]),
     ("🎧 Audio trigger", [
         ("audio_enabled", "Audio keyword trigger ON", "bool", ""),
@@ -826,12 +1032,14 @@ FIELDS = [
     ("⚙️ System", [
         ("max_streams", "Max parallel streams", "number", "1-5"),
         ("keepalive", "Self keep-alive ping", "bool", "Free plan par sleep rokne ki koshish"),
+        ("retry_forever", "Offline stream ka intezaar", "bool", "ON = channel /live link offline ho to band nahi hoga, live aate hi shuru"),
         ("ytdlp_extra_args", "yt-dlp extra args", "text", "Advanced, e.g. --js-runtimes node"),
     ]),
 ]
 NUM_RANGE = {"clip_seconds": (5, 60), "cooldown_seconds": (0, 600), "buffer_seconds": (40, 300),
              "max_height": (144, 1080), "audio_chunk_seconds": (8, 60),
-             "audio_daily_limit": (0, 100000), "max_streams": (1, 5)}
+             "audio_daily_limit": (0, 100000), "max_streams": (1, 5),
+             "post_roll_seconds": (0, 30)}
 
 BASE = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>ClipBot</title>
@@ -867,6 +1075,10 @@ LOGIN = """{% extends "base.html" %}{% block body %}
 DASH = """{% extends "base.html" %}
 {% block head %}<meta http-equiv="refresh" content="20">{% endblock %}
 {% block body %}
+<div class="c"><h2>Telegram</h2>
+{% if tgs.ok %}<span class="ok">● connected</span> @{{ tgs.me }} • owners: {{ tgs.owners }}
+{% if not tgs.owners %}<div class="e"><small>Telegram me bot ko /start &lt;ADMIN_PASSWORD&gt; bhejo</small></div>{% endif %}
+{% else %}<span class="e">● {{ tgs.err }}</span>{% endif %}</div>
 <div class="c"><h2>Live link add karo</h2>
 <form method="post" action="/watch" class="r"><input type="hidden" name="csrf" value="{{ csrf }}">
 <input name="link" placeholder="https://youtube.com/live/..." required><button>▶ Watch shuru</button></form>
@@ -944,7 +1156,7 @@ def headers(r):
 
 @app.route("/health")
 def health():
-    return jsonify(ok=True, streams=len(WATCHERS))
+    return jsonify(ok=True, streams=len(WATCHERS), telegram=TG_STATE["ok"])
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -980,7 +1192,10 @@ def dash():
         setup.append("⚠ Telegram me /start <password> bhejo")
     if not S.get("groq_api_key"):
         setup.append("ℹ Groq key nahi (audio trigger off)")
-    return render_template("dash.html", ws=status_rows(), hist=list(HISTORY)[:15],
+    return render_template("dash.html",
+                           tgs={"ok": TG_STATE["ok"], "me": TG_STATE["me"], "err": TG_STATE["err"],
+                                "owners": len(owners())},
+                           ws=status_rows(), hist=list(HISTORY)[:15],
                            logs="\n".join(list(LOGS)[-60:][::-1]), maxs=S.get("max_streams"),
                            setup=" • ".join(setup) or "✓ ready")
 
@@ -1029,7 +1244,15 @@ def settings():
                 else:
                     upd[key] = v.strip()
         S.update(**upd)
-        flash("Saved ✓ (token badla ho to bot ~30 sec me naye token par aa jayega)")
+        msg = "Saved ✓"
+        if upd.get("telegram_token"):
+            try:
+                me = requests.get(f"https://api.telegram.org/bot{upd['telegram_token']}/getMe", timeout=15).json()
+                msg += (f" • Telegram token OK: @{me['result']['username']} (30 sec me connect)"
+                        if me.get("ok") else " • ❌ Telegram token galat hai!")
+            except Exception:
+                msg += " • Telegram check nahi ho paaya (network)"
+        flash(msg)
         return redirect("/settings")
     sections = []
     for title, fs in FIELDS:
