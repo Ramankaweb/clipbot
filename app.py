@@ -132,12 +132,22 @@ if not S.get("secret_key"):
     S.update(secret_key=os.environ.get("SECRET_KEY") or secrets.token_hex(32))
 
 
-def check_pw(pw):
+def check_pw(pw, loose=False):
+    pw = (pw or "").strip()
+    cands = [pw]
+    if loose:  # Telegram: people type <password> or "password" by mistake
+        for t in (pw.strip("<>"), pw.strip("\"'`<>")):
+            if t and t not in cands:
+                cands.append(t)
     h = S.get("admin_password_hash")
-    if h:
-        return check_password_hash(h, pw)
-    env = os.environ.get("ADMIN_PASSWORD", "")
-    return bool(env) and hmac.compare_digest(pw.encode(), env.encode())
+    env = os.environ.get("ADMIN_PASSWORD", "").strip()
+    for c in cands:
+        if h:
+            if check_password_hash(h, c):
+                return True
+        elif env and hmac.compare_digest(c.encode(), env.encode()):
+            return True
+    return False
 
 
 # brute-force lock (per IP / per telegram chat)
@@ -326,7 +336,7 @@ class Watcher:
 
     def resolve(self):
         h = int(S.get("max_height"))
-        base = ["yt-dlp", "-g", "--no-warnings", "--no-playlist",
+        base = ["yt-dlp", "-g", "--no-playlist",
                 "-f", f"best[height<={h}]/best"]
         if shutil.which("node"):
             base += ["--js-runtimes", "node"]
@@ -337,7 +347,8 @@ class Watcher:
         # default client first, then HLS-friendly fallbacks (live streams)
         attempts = [[],
                     ["--extractor-args", "youtube:player_client=web_safari"],
-                    ["--extractor-args", "youtube:player_client=tv"]]
+                    ["--extractor-args", "youtube:player_client=tv"],
+                    ["--remote-components", "ejs:github"]]
         last = "yt-dlp fail"
         for extra in attempts:
             if self.stop_ev.is_set():
@@ -349,8 +360,8 @@ class Watcher:
                 if urls:
                     return urls[:2]
             lines = [l for l in r.stderr.strip().splitlines() if l.strip()]
-            if lines:
-                last = scrub(lines[-1])
+            if lines and last == "yt-dlp fail":  # keep the FIRST attempt's real error
+                last = scrub(" | ".join(lines[-3:]))[:400]
         raise RuntimeError(last)
 
     def record_loop(self):
@@ -420,6 +431,9 @@ class Watcher:
         with self.clip_lock:
             segs = self.segments()
             if len(segs) < 2:
+                self.logm("clip fail: buffer khali")
+                notify(f"❌ Clip nahi bani ({title}): stream abhi record nahi ho rahi (buffer khali). "
+                       "Dashboard ka Log dekho.")
                 return False, "Buffer abhi khali hai, thoda ruko"
             segs = segs[:-1]  # newest file is still being written
             cutoff = time.time() - seconds - 3
@@ -887,7 +901,7 @@ def handle(u):
         if cmd == "/start" and arg:  # registration attempt
             if locked("tg" + chat):
                 say(chat, "⏳ Bahut galat koshish. 5 min baad try karo.")
-            elif check_pw(arg):
+            elif check_pw(arg, loose=True):
                 good("tg" + chat)
                 S.update(owner_chat_ids=owners() + [chat])
                 tg("deleteMessage", {"chat_id": chat, "message_id": m.get("message_id")})
@@ -896,11 +910,14 @@ def handle(u):
                                    "reply_markup": json.dumps(MENU_KB)})
             else:
                 bad("tg" + chat)
-                say(chat, "❌ Password galat. ADMIN_PASSWORD wahi hai jo web panel login ka hai.")
+                say(chat, "❌ Password galat. Bina < > ke, web panel login wala password bhejo "
+                          "(agar panel me password badla tha to wahi naya).\n\n"
+                          f"Ya web panel Dashboard me ye Chat ID daalo: {chat}")
         elif time.time() - LAST_HINT.get(chat, 0) > 30:  # don't spam strangers
             LAST_HINT[chat] = time.time()
             say(chat, "🔒 Ye private bot hai.\nOwner register karne ke liye bhejo:\n"
-                      "/start <ADMIN_PASSWORD>\n(wahi password jo web panel login ka hai)")
+                      "/start tumhara_password   (< > mat lagao)\n(wahi jo web panel login ka hai)\n\n"
+                      f"Ya web panel Dashboard me ye Chat ID daalo: {chat}")
         return
 
     run_cmd(chat, cmd, arg, text)
@@ -1078,7 +1095,9 @@ DASH = """{% extends "base.html" %}
 <div class="c"><h2>Telegram</h2>
 {% if tgs.ok %}<span class="ok">● connected</span> @{{ tgs.me }} • owners: {{ tgs.owners }}
 {% if not tgs.owners %}<div class="e"><small>Telegram me bot ko /start &lt;ADMIN_PASSWORD&gt; bhejo</small></div>{% endif %}
-{% else %}<span class="e">● {{ tgs.err }}</span>{% endif %}</div>
+{% else %}<span class="e">● {{ tgs.err }}</span>{% endif %}
+<form method="post" action="/tg/owner" class="r"><input type="hidden" name="csrf" value="{{ csrf }}"><input name="chat_id" inputmode="numeric" placeholder="Telegram Chat ID (bot ko kuch bhejo, wo ID bata dega)"><button class="g">Owner add</button></form>
+{% if tgs.owners %}<form method="post" action="/tg/reset" class="r"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="g">Owners reset</button></form>{% endif %}</div>
 <div class="c"><h2>Live link add karo</h2>
 <form method="post" action="/watch" class="r"><input type="hidden" name="csrf" value="{{ csrf }}">
 <input name="link" placeholder="https://youtube.com/live/..." required><button>▶ Watch shuru</button></form>
@@ -1117,7 +1136,8 @@ SETT = """{% extends "base.html" %}{% block body %}
 <div class="c" style="margin-top:14px"><h2>Tools</h2><div class="r">
 <form method="post" action="/test/telegram"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="g">Telegram test</button></form>
 <form method="post" action="/test/groq"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="g">Groq test</button></form>
-<form method="post" action="/ytdlp/update"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="g">yt-dlp update</button></form></div></div>
+<form method="post" action="/ytdlp/update"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="g">yt-dlp update</button></form></div>
+<form method="post" action="/diag" class="r"><input type="hidden" name="csrf" value="{{ csrf }}"><input name="link" placeholder="Live link (khali = chalti stream ka link)"><button class="g">🩺 Diagnose</button></form></div>
 <div class="c"><h2>Admin password badlo</h2>
 <form method="post" action="/password"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Naya password (min 10 char)</label><input type="password" name="pw" minlength="10" required>
@@ -1315,6 +1335,65 @@ def chpw():
         S.update(admin_password_hash=generate_password_hash(pw))
         flash("Password badal gaya ✓")
     return redirect("/settings")
+
+
+def _diag(link):
+    def sh(cmd, t=90):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=t)
+            return (r.stdout + r.stderr).strip()
+        except Exception as e:
+            return f"error: {e}"
+    log.info("DIAG ---- shuru ----")
+    log.info("DIAG yt-dlp version: %s", sh(["yt-dlp", "--version"]))
+    log.info("DIAG node version: %s", sh(["node", "--version"]))
+    ff = sh(["ffmpeg", "-version"]).splitlines()
+    log.info("DIAG ffmpeg: %s", ff[0] if ff else "missing")
+    log.info("DIAG cookies saved: %s", "haan" if (S.get("cookies") or "").strip() else "NAHI")
+    if link:
+        cmd = ["yt-dlp", "-v", "-F", "--no-playlist"]
+        if shutil.which("node"):
+            cmd += ["--js-runtimes", "node"]
+        cf = cookies_file()
+        if cf:
+            cmd += ["--cookies", cf]
+        out = sh(cmd + ["--", link], 150).splitlines()
+        for l in reversed(out[-25:]):  # dashboard log shows newest first
+            log.info("DIAG | %s", l[:220])
+    log.info("DIAG ---- khatam (neeche se upar padho) ----")
+
+
+@app.route("/diag", methods=["POST"])
+def diag():
+    link = request.form.get("link", "").strip()
+    if not link:
+        rows = status_rows()
+        link = rows[0]["link"] if rows else ""
+    threading.Thread(target=_diag, args=(link,), daemon=True).start()
+    flash("Diagnose chal raha hai. 1-2 min baad Dashboard ka Log dekho (DIAG lines).")
+    return redirect("/")
+
+
+@app.route("/tg/owner", methods=["POST"])
+def tg_owner():
+    cid = request.form.get("chat_id", "").strip()
+    if not re.fullmatch(r"-?\d{5,15}", cid):
+        flash("Chat ID sirf number hota hai. Bot ko koi message bhejo, wo ID bata dega.")
+    else:
+        if cid not in owners():
+            S.update(owner_chat_ids=owners() + [cid])
+        say(cid, "✅ Registered! Ab ye bot sirf tumhara hai.\n\n" + HELP)
+        tg("sendMessage", {"chat_id": cid, "text": "🎛 Control panel",
+                           "reply_markup": json.dumps(MENU_KB)})
+        flash("Owner add ho gaya ✓ Telegram check karo")
+    return redirect("/")
+
+
+@app.route("/tg/reset", methods=["POST"])
+def tg_reset():
+    S.update(owner_chat_ids=[])
+    flash("Saare owners hata diye. Ab dobara register karo.")
+    return redirect("/")
 
 
 start_background()
